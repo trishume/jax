@@ -67,9 +67,11 @@ Remember to align the itemized text with the first line of an item within a list
   * {func}`jax.scipy.special.logsumexp` with `return_sign=True` now uses the NumPy 2.0
     convention for the complex sign, `x / abs(x)`. This is consistent with the behavior
     of {func}`scipy.special.logsumexp` in SciPy v1.13.
-
   * JAX now supports the bool DLPack type for both import and export.
     Previously bool values could not be imported and were exported as integers.
+  * JAX default native serialization version is now 9. This is relevant
+    for {mod}`jax.experimental.jax2tf` and {mod}`jax.experimental.export`.
+    See [description of version numbers](https://github.com/google/jax/blob/main/jax/experimental/jax2tf/README.md#native-serialization-versions). 
 
 * Deprecations & Removals
   * A number of previously deprecated functions have been removed, following a
