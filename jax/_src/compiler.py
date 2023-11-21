@@ -254,16 +254,13 @@ def compile_or_get_cached(
   supported_platforms = ["tpu", "gpu"]
   if xla_extension_version >= 230:
     supported_platforms.append("cpu")
-  use_compilation_cache = (config.enable_compilation_cache.value and
-                           backend.platform in supported_platforms)
+  use_compilation_cache = compilation_cache.is_cache_used(
+      backend.platform in supported_platforms)
 
   if not use_compilation_cache:
     return backend_compile(backend, computation, compile_options,
                            host_callbacks)
 
-  compilation_cache.set_once_cache_used(
-      lambda: monitoring.record_event(
-          "/jax/compilation_cache/tasks_using_cache"))
   monitoring.record_event('/jax/compilation_cache/compile_requests_use_cache')
 
   try:

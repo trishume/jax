@@ -42,25 +42,37 @@ _cache: CacheInterface | None = None
 
 _cache_initialized: bool = False
 
+_cache_checked: bool = False
+
 _cache_used: bool = False
 
-# Mutex to protect _cache_initialized and _cache_used.
+# Mutex to protect _cache_initialized.
 _cache_initialized_mutex = threading.Lock()
 
+# Mutex to protect _cache_checked and _cache_used.
+_cache_checked_mutex = threading.Lock()
 
-def set_once_cache_used(f) -> None:
-  """One-time setting of _cache_used.
 
-  If _cache_used is False, set it to True and execute the provided function
-  f. No action if _cache_used is True. This provides a mechanism to execute f
-  once per task. Note that reset_cache() will reset _cache_used also.
+def is_cache_used(support_platform) -> bool:
+  """Check if cache is used and report adoption metrics one-time per task.
+
+  If _cache_checked is False, set it to True, report metrics and return if cache
+  is used. Return _cache_used directly if _cache_checked is True. This provides
+  a mechanism to report the metrics once per task. Note that reset_cache() will
+  reset _cache_checked and _cache_used also.
   """
-  global _cache_used
-  with _cache_initialized_mutex:
-    if not _cache_used:
+  global _cache_checked, _cache_used
+  with _cache_checked_mutex:
+    if _cache_checked:
+      return _cache_used
+
+    _cache_checked = True
+    if not _is_cache_enabled():
+      monitoring.record_event('/jax/compilation_cache/task_disabled_cache')
+    elif support_platform and _get_cache() is not None:
+      monitoring.record_event('/jax/compilation_cache/tasks_using_cache')
       _cache_used = True
-      if f is not None:
-        f()
+    return _cache_used
 
 
 def get_file_cache(path: str) -> CacheInterface:
@@ -238,12 +250,14 @@ def reset_cache() -> None:
   """Get back to pristine, uninitialized state."""
   global _cache
   global _cache_initialized
+  global _cache_checked
   global _cache_used
   logger.debug("Resetting cache at %s.",
                _cache._path if _cache is not None else "<empty>")
   _cache = None
-  with _cache_initialized_mutex:
+  with (_cache_initialized_mutex, _cache_checked_mutex):
     _cache_initialized = False
+    _cache_checked = False
     _cache_used = False
 
 
