@@ -17,25 +17,26 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import logging
+import os
+import tempfile
 import time
 from typing import Any
-import logging
 import warnings
 
-import numpy as np
-
-from jax._src import lib
-from jax._src import distributed
 from jax._src import compilation_cache
 from jax._src import config as config
-from jax._src.xla_bridge import process_count
+from jax._src import distributed
+from jax._src import lib
 from jax._src import monitoring
 from jax._src import profiler
 from jax._src import traceback_util
 from jax._src.interpreters import mlir
+from jax._src.lib import xla_client as xc
 from jax._src.lib import xla_extension_version
 from jax._src.lib.mlir import ir
-from jax._src.lib import xla_client as xc
+from jax._src.xla_bridge import process_count
+import numpy as np
 
 
 _DISABLE_MOST_OPTIMIZATIONS = config.DEFINE_bool(
@@ -303,33 +304,78 @@ def compile_or_get_cached(
   ):
     share_timeout = config.share_binary_between_hosts_timeout_ms.value
     global_client = distributed.global_state.client
-
-    # TODO: Using module name as a cache key might lead to issues when the
-    # the module with the same name should be recompiled. This cache should be
-    # replaced with proper cache eviction logic based on barriers.
-    if module_name in compile_or_get_cached.cached_modules:
-      return compile_or_get_cached.cached_modules[module_name]
+    module_cache_key = module_name + "_" + str(
+        get_module_next_index(module_name)
+    )
 
     # The coordinator host should compile the module and write it to the K-V
     # storage.
     # TODO: In case when coordinator process is not participating in the
     # computation we need to choose another host to compile the module.
-    if distributed.global_state.service is None:
-      serialized_executable = global_client.blocking_key_value_get_bytes(
-          module_name, share_timeout)
-      serialized_executable = compilation_cache.decompress_executable(
-          serialized_executable)
-      executable = backend.deserialize_executable(
-          serialized_executable, compile_options)
-    else:
+    if distributed.global_state.process_id == 0:
       executable = backend_compile(backend, computation,
                                    compile_options, host_callbacks)
       serialized_executable = backend.serialize_executable(executable)
       serialized_executable = compilation_cache.compress_executable(
           serialized_executable)
-      global_client.key_value_set(module_name, serialized_executable)
+      global_client.key_value_set(module_cache_key, serialized_executable)
+    else:
+      serialized_executable = global_client.blocking_key_value_get_bytes(
+          module_cache_key, share_timeout)
+      serialized_executable = compilation_cache.decompress_executable(
+          serialized_executable)
+      executable = backend.deserialize_executable(
+          serialized_executable, compile_options)
+    return executable
+  elif (
+      process_count() > 1
+      and config.share_autotune_config_between_hosts.value
+      and distributed.global_state.client is not None
+  ):
+    share_timeout = config.share_binary_between_hosts_timeout_ms.value
+    global_client = distributed.global_state.client
+    debug_options = compile_options.executable_build_options.debug_options
+    module_cache_key = module_name + "_" + str(
+        get_module_next_index(module_name)
+    )
+    autotune_tmp_file = os.path.join(
+        compile_or_get_cached.autotune_configs_dir, module_cache_key
+    )
 
-    compile_or_get_cached.cached_modules[module_name] = executable
+    # If module were previously compiled use existing config.
+    if os.path.exists(autotune_tmp_file):
+      debug_options.xla_gpu_load_autotune_results_from = autotune_tmp_file
+      executable = backend_compile(
+          backend, computation, compile_options, host_callbacks
+      )
+      return executable
+
+    # The coordinator process should compile the module and write autotune
+    # config to the K-V storage.
+    # TODO: In case when coordinator process is not participating in the
+    # computation we need to choose another host to compile the module.
+    if distributed.global_state.process_id == 0:
+      debug_options.xla_gpu_dump_autotune_results_to = autotune_tmp_file
+      executable = backend_compile(
+          backend, computation, compile_options, host_callbacks
+      )
+      with open(autotune_tmp_file, "rb") as f:
+        autotune_config = f.read()
+
+      autotune_config = compilation_cache.compress_executable(autotune_config)
+      global_client.key_value_set(module_cache_key, autotune_config)
+    else:
+      autotune_config = global_client.blocking_key_value_get_bytes(
+          module_cache_key, share_timeout
+      )
+      autotune_config = compilation_cache.decompress_executable(autotune_config)
+      with open(autotune_tmp_file, "wb") as f:
+        f.write(autotune_config)
+
+      debug_options.xla_gpu_load_autotune_results_from = autotune_tmp_file
+      executable = backend_compile(
+          backend, computation, compile_options, host_callbacks
+      )
     return executable
   else:
     start_time = time.monotonic()
@@ -340,7 +386,16 @@ def compile_or_get_cached(
                  host_callbacks)
     return executable
 
-compile_or_get_cached.cached_modules = {}
+def get_module_next_index(module_name: str) -> int:
+  if module_name in get_module_next_index.module_to_index:
+    get_module_next_index.module_to_index[module_name] += 1
+  else:
+    get_module_next_index.module_to_index[module_name] = 1
+
+  return get_module_next_index.module_to_index[module_name]
+
+get_module_next_index.module_to_index = {}
+compile_or_get_cached.autotune_configs_dir = tempfile.mkdtemp()
 
 def _cache_read(
     module_name: str, cache_key: str, compile_options: xc.CompileOptions,
