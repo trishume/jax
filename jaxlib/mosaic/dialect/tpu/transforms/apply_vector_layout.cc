@@ -508,26 +508,38 @@ FailureOr<SmallVector<Layout>> getLayoutArrayFromAttr(const Attribute attr) {
 FailureOr<SmallVector<Layout>> getOutLayout(Operation &op) {
   // TODO(tlongeri): non-array attribute path should be removed after tests are
   // updated
-  FailureOr<Layout> failure_or_layout =
+  FailureOr<Layout> failure_or_layouts =
       getLayoutFromAttr(op.getAttr("out_layout"));
-  if (succeeded(failure_or_layout)) {
-    return SmallVector<Layout>{failure_or_layout.value()};
+  if (succeeded(failure_or_layouts)) {
+    return SmallVector<Layout>{failure_or_layouts.value()};
   }
-  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> out_layout,
+  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> out_layouts,
                              getLayoutArrayFromAttr(op.getAttr("out_layout")));
-  if (out_layout.size() != op.getNumResults()) {
-    return failure();
+  if (out_layouts.size() != op.getNumResults()) {
+    return op.emitOpError(
+        "out_layout attribute does not match number of results");
   }
-  return out_layout;
+  for (auto [result, l] : llvm::zip_equal(op.getResults(), out_layouts)) {
+    if (isa<VectorType>(result.getType()) != l.has_value()) {
+      return op.emitOpError("Output layout does not match result type");
+    }
+  }
+  return out_layouts;
 }
 
 FailureOr<SmallVector<Layout>> getInLayout(Operation &op) {
-  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> in_layout,
+  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> in_layouts,
                              getLayoutArrayFromAttr(op.getAttr("in_layout")));
-  if (in_layout.size() != op.getNumOperands()) {
-    return failure();
+  if (in_layouts.size() != op.getNumOperands()) {
+    return op.emitOpError(
+        "in_layout attribute does not match number of operands");
   }
-  return in_layout;
+  for (auto [operand, l] : llvm::zip_equal(op.getOperands(), in_layouts)) {
+    if (isa<VectorType>(operand.getType()) != l.has_value()) {
+      return op.emitOpError("Output layout does not match result type");
+    }
+  }
+  return in_layouts;
 }
 
 LogicalResult elementwise_op_rule(RewriteContext &ctx, Operation &op,
@@ -2244,36 +2256,63 @@ LogicalResult vector_extract_rule(RewriteContext &ctx, Operation &op,
   }
   CHECK_EQ(layouts_in.size(), 1);
   CHECK_EQ(layouts_out.size(), 1);
-  if (!layouts_in.front().has_value()) {
-    return op.emitOpError("Expected non-null output layout");
-  }
+  CHECK(layouts_in.front().has_value());
+  const VectorType res_vty =
+      dyn_cast<VectorType>(extract_op.getResult().getType());
+  CHECK_EQ(layouts_out.front().has_value(), res_vty != nullptr);
   const VectorLayout &layout_in = *layouts_in.front();
-  if (layouts_out.front().has_value()) {
-    return op.emitOpError("Not implemented: Only scalar results supported");
-  }
   if (layout_in.bitwidth() != 32) {
     return op.emitOpError(
         "Not implemented: Only 32-bit vector.extract supported");
   }
-  if (layout_in.offsets() != LayoutOffsets{0, 0}) {
-    return op.emitOpError("Not implemented: Unsupported layout");
-  }
-  ImplicitLocOpBuilder builder(op.getLoc(), &op);
   for (int64_t i : extract_op.getStaticPosition()) {
     if (i != 0) {
       return op.emitOpError("Not implemented: Only 0 indices supported");
     }
   }
-  FAILUREOR_ASSIGN_OR_RETURN(
-      const xla::Array<Value> vregs,
-      disassemble(builder, layout_in, extract_op.getVector(),
-                  ctx.target_shape));
-  CHECK_GT(vregs.num_elements(), 0);
-  extract_op.replaceAllUsesWith(
-      builder
-          .create<vector::ExtractOp>(op.getLoc(), *vregs.data(),
-                                     ArrayRef<int64_t>{0, 0})
-          .getResult());
+  ImplicitLocOpBuilder builder(op.getLoc(), &op);
+  if (res_vty != nullptr) {
+    const VectorLayout &layout_out = *layouts_out.front();
+    if (layout_in != layout_out) {
+      return op.emitOpError("Different input and output layouts");
+    }
+    const unsigned num_indices = extract_op.getNumIndices();
+    const VectorType vty = extract_op.getSourceVectorType();
+    const ArrayRef<int64_t> vector_shape = vty.getShape();
+    for (int64_t d : vector_shape.take_front(num_indices)) {
+      if (d != 1) {
+        return op.emitOpError(
+            "Not implemented: Only indexing singleton dimensions supported for "
+            "non-scalar results");
+      }
+    }
+    FAILUREOR_ASSIGN_OR_RETURN(
+        xla::Array<Value> vregs,
+        disassemble(builder, layout_in, extract_op.getVector(),
+                    ctx.target_shape));
+    // Squeeze leading singleton dimensions.
+    // Copy dims to temporary before passing to xla::Array::Reshape - it cannot
+    // take a pointer to its own data.
+    vregs.Reshape(SmallVector<int64_t>(
+        toArrayRef(vregs.dimensions()).drop_front(num_indices)));
+    extract_op.replaceAllUsesWith(
+        assemble(builder, res_vty, layout_out, vregs, ctx.target_shape)
+            .getResult());
+  } else {
+    if (layout_in.offsets() != LayoutOffsets{0, 0}) {
+      return op.emitOpError("Not implemented: Unsupported layout");
+    }
+    FAILUREOR_ASSIGN_OR_RETURN(
+        const xla::Array<Value> vregs,
+        disassemble(builder, layout_in, extract_op.getVector(),
+                    ctx.target_shape));
+    CHECK_GT(vregs.num_elements(), 0);
+    extract_op.replaceAllUsesWith(
+        builder
+            .create<vector::ExtractOp>(op.getLoc(), *vregs.data(),
+                                      ArrayRef<int64_t>{0, 0})
+            .getResult());
+  }
   extract_op.erase();
   return success();
 }
@@ -3941,24 +3980,21 @@ LogicalResult applyLayoutOp(RewriteContext &ctx, Operation &op) {
   // If one of the operands is not of vector type, the corresponding entry in
   // the layout_in tuple will be None. The same applies to the results of the
   // operation and the layout_out tuple.
-  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> layout_out,
+  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> layouts_out,
                              getOutLayout(op));
-  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> layout_in,
+  FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> layouts_in,
                              getInLayout(op));
-  if (!layout_in.empty() && !isa<tpu::AssumeLayoutOp>(op)) {
+  if (!layouts_in.empty() && !isa<tpu::AssumeLayoutOp>(op)) {
     // Relayout the operands, if their requested input layouts don't match the
     // layouts in which they were produced.
     for (auto [idx, tup] :
-         llvm::enumerate(llvm::zip(op.getOperands(), layout_in))) {
+         llvm::enumerate(llvm::zip(op.getOperands(), layouts_in))) {
       auto [operand, li] = tup;
       auto vty = dyn_cast<VectorType>(operand.getType());
-      if ((vty == nullptr) == li.has_value()) {
-        return op.emitError(
-            "Layout should be none iff operand is not a vector");
-      }
       if (vty == nullptr) {
         continue;
       }
+      CHECK(li.has_value());
 
       // The operand should always be an Operation (and not a BlockArgument)
       // since we expect the FuncOp to have only memrefs and semaphores as
@@ -3973,9 +4009,7 @@ LogicalResult applyLayoutOp(RewriteContext &ctx, Operation &op) {
       FAILUREOR_ASSIGN_OR_RETURN(const SmallVector<Layout> def_layouts,
                                  getOutLayout(*def_op));
       const Layout lo = def_layouts[res_idx];
-      if (!lo.has_value()) {
-        return op.emitError() << "Vector result should have a defined layout";
-      }
+      CHECK(lo.has_value());
       if (lo->generalizes(*li, vty.getShape(), ctx.target_shape)) {
         continue;
       }
@@ -3988,9 +4022,9 @@ LogicalResult applyLayoutOp(RewriteContext &ctx, Operation &op) {
   }
 
   const bool no_vector_args =
-      llvm::none_of(layout_out,
+      llvm::none_of(layouts_out,
                     [](Layout layout) { return layout.has_value(); }) &&
-      llvm::none_of(layout_in,
+      llvm::none_of(layouts_in,
                     [](Layout layout) { return layout.has_value(); });
   if (no_vector_args && op.getRegions().empty()) {
     // We don't need to do anything for scalar operations.
@@ -4005,10 +4039,10 @@ LogicalResult applyLayoutOp(RewriteContext &ctx, Operation &op) {
   if (auto rule_it = rules().find(op.getName().getStringRef());
       rule_it != rules().end()) {
     const rule_type &rule = rule_it->getValue();
-    return rule(ctx, op, layout_in, layout_out);
+    return rule(ctx, op, layouts_in, layouts_out);
   }
   if (OpTrait::hasElementwiseMappableTraits(&op)) {
-    return elementwise_op_rule(ctx, op, layout_in, layout_out);
+    return elementwise_op_rule(ctx, op, layouts_in, layouts_out);
   }
   return op.emitError("Not implemented: Unsupported operation: ")
          << op.getName();

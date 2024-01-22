@@ -935,10 +935,17 @@ class VectorLayoutInferer {
         "Only 32-bit types supported");
     auto layout = getLayout(op.getVector());
     TPU_CHECK_OP(layout.has_value(), "missing vector layout");
-    setLayout(op,
+    VectorType res_vty = dyn_cast<VectorType>(op.getResult().getType());
+    if (res_vty != nullptr) {
+      TPU_CHECK_OP(layout->layout_rank() <= res_vty.getRank(),
+                   "Not implemented: Result rank smaller than layout rank");
+      setLayout(op, layout, layout);
+    } else {
+      setLayout(op,
               VectorLayout(kNativeBitwidth, {0, 0}, layout->tiling(),
                            layout->implicit_dim()),
               kNoLayout);
+    }
     return success();
   }
 
