@@ -20,6 +20,7 @@ struct RewriteContext {
   // TODO(tlongeri): target_shape should be determined from hardware_generation
   const int hardware_generation;
   const std::array<int64_t, 2> target_shape;
+  const std::array<int64_t, 2> mxu_shape;
 
   MLIRContext *getMLIRContext() { return func.getContext(); }
 };
