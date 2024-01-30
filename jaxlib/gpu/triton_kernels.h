@@ -97,6 +97,7 @@ class AutotunedKernelCall {
       size_t, size_t>> input_output_aliases);
 
   static absl::StatusOr<KernelCall> Autotune(AutotunedKernelCall kernel_call,
+                                             gpuStream_t original_stream,
                                              void** buffers);
 
   static absl::StatusOr<AutotunedKernelCall> FromProto(
