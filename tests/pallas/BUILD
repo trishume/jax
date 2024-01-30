@@ -58,7 +58,7 @@ jax_test(
     ] + py_deps("absl/testing") + py_deps("numpy"),
 )
 
-py_test(
+jax_test(
     name = "indexing_test",
     srcs = [
         "indexing_test.py",
